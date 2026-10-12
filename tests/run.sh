@@ -111,13 +111,19 @@ EOF
 out=$(HOME="$SB" "$TOOL" version 2>&1)
 has "配置文件里的 GITMNG_HOSTS 生效" "hosts=only.test" "$out"
 
-echo "== 7. init --revert 干净移除规则块 =="
+echo "== 7. probe-url：只有路由主机做链路实测，其他主机不去 ls-remote 别人的探针仓库 =="
+out=$(HOME="$SB" GITMNG_ROUTE_HOST=gh.test GITMNG_PROBE_REPO=o/r "$TOOL" probe-url gh.test 2>&1)
+eq "路由主机 → 走路由 + 探针仓库" "route https://gh.test/o/r" "$out"
+out=$(HOME="$SB" GITMNG_ROUTE_HOST=gh.test GITMNG_PROBE_REPO=o/r "$TOOL" probe-url gl.test 2>&1)
+eq "非路由主机 → 只测 HTTPS 可达性" "web https://gl.test/" "$out"
+
+echo "== 8. init --revert 干净移除规则块 =="
 "$TOOL" init --revert >/tmp/gm-revert.log 2>&1
 eq "revert 后规则块数量为 0" "0" "$(grep -c '# >>> git-mng identity routing' "$SB/.gitconfig")"
 eq "revert 后原 [user] 兜底身份仍在" "fallback@example.com" "$(git -C "$SB/code/a" config user.email)"
 has "revert 未删除身份文件" "alice@example.com" "$(cat "$SB/.config/git-mng/identity/gh.test")"
 
-echo "== 8. 空输入取消，不写任何文件 =="
+echo "== 9. 空输入取消，不写任何文件 =="
 SB2=$(mktemp -d)/home; mkdir -p "$SB2/code"
 cat > "$SB2/.gitconfig" <<'EOF'
 [user]

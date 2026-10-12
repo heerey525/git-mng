@@ -44,6 +44,7 @@ git-mng — GitHub / Gitee 凭据、提交身份与访问路由体检
   git-mng route bench        实测 direct / 镜像 / SSH 三条链路成功率
   git-mng route ssh|proxy|direct|status    切换访问路由（互斥）
   git-mng login <host>       交互录入该主机凭据并验证（失败自动撤销）
+  git-mng probe-url [host]   打印 doctor 对该主机的探测方式与地址（排障用）
   git-mng version            版本与自检
 
 配置文件（可选）~/.config/git-mng/config，shell 语法：
@@ -51,7 +52,7 @@ git-mng — GitHub / Gitee 凭据、提交身份与访问路由体检
   GITMNG_OWNER_ACCOUNT="your-gh-login"        # fix-ssh 判定自有仓库
   GITMNG_SCAN_ROOTS="$HOME/code $HOME/projects"
   GITMNG_GHPROXY="https://gh-proxy.com/"      # route proxy 用的镜像前缀
-  GITMNG_PROBE_REPO="octocat/Hello-World"
+  GITMNG_PROBE_REPO="octocat/Hello-World"      # 仅路由主机用它测链路，其余主机只测 HTTPS
 EOF
 }
 
@@ -310,6 +311,23 @@ cmd_fix_ssh() {
 # ---------------------------------------------------------------- route
 SSH_PREFIX_ROUTE() { printf 'git@%s:' "$ROUTE_HOST"; }
 
+# doctor 对不同主机测什么：只有路由主机才用 GITMNG_PROBE_REPO 测路由链路，
+# 其他主机（如 Gitee）拿 GitHub 的仓库去 ls-remote 必然失败，只做 HTTPS 可达性。
+probe_kind() { [ "$1" = "$ROUTE_HOST" ] && echo route || echo web; }
+
+probe_url_for() {
+  case "$(probe_kind "$1")" in
+    route) route_url "$(route_current)" "$PROBE_REPO" ;;
+    web)   printf 'https://%s/\n' "$1" ;;
+  esac
+}
+
+# 打印 doctor 对某主机的探测方式（route=走路由测探针仓库，web=只测 HTTPS 可达性）与地址
+cmd_probe_url() {
+  h="${1:-$ROUTE_HOST}"
+  printf '%s %s\n' "$(probe_kind "$h")" "$(probe_url_for "$h")"
+}
+
 route_current() {
   k1="url.$(SSH_PREFIX_ROUTE).insteadOf"
   k2="url.${GHPROXY}https://${ROUTE_HOST}/.insteadOf"
@@ -472,10 +490,19 @@ cmd_doctor() {
       "") info "SSH 无响应（22 端口可能被拦）" ;;
       *)  info "SSH: $sshout" ;;
     esac
-    if probe_git "$(route_url "$(route_current)" "$PROBE_REPO" 2>/dev/null || printf 'https://%s/%s' "$h" "$PROBE_REPO")"; then
-      ok "$(route_current) 路由实测可读"
+    purl=$(probe_url_for "$h")
+    if [ "$(probe_kind "$h")" = "route" ]; then
+      if probe_git "$purl"; then
+        ok "$(route_current) 路由实测可读 $PROBE_REPO"
+      else
+        warn "$(route_current) 路由实测失败 → git-mng route bench"
+      fi
     else
-      warn "$(route_current) 路由实测失败 → git-mng route bench"
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "$purl" 2>/dev/null)
+      case "$code" in
+        2??|3??|4??) ok "HTTPS 直连可达: http $code" ;;
+                *) warn "HTTPS 到 $h 不通（http ${code:-无响应}）" ;;
+      esac
     fi
   done
 }
@@ -496,6 +523,7 @@ case "$cmd" in
   fix-ssh)  cmd_fix_ssh "$@" ;;
   route)    cmd_route "$@" ;;
   login)    cmd_login "$@" ;;
+  probe-url) cmd_probe_url "$@" ;;
   version|--version) cmd_version ;;
   ""|-h|--help|help) usage ;;
   *) bad "未知命令: $cmd"; usage; exit 2 ;;

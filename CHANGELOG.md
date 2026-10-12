@@ -15,5 +15,6 @@
 - `fix-ssh`：自有账号仓库转 `git@host:` 以恢复推送通道；第三方仓库还原直连 HTTPS。
 - `route bench` / `route ssh|proxy|direct|status`：用同一公共仓库实测 direct / 镜像 / SSH 三条链路成功率（测量时绕过全局配置，避免当前路由的重写规则污染结果），并互斥地设置 `url.<...>.insteadOf`。
 - `login <host>`：交互录入 HTTPS 凭据（不回显），先经真实 `ls-remote` 验证，失败自动从钥匙串撤销，不留半坏凭据。
-- `tests/run.sh`：28 项自测，全程临时 HOME 沙箱，不触碰真实配置与网络。
+- `probe-url [host]`：打印 `doctor` 对某主机的探测方式与地址。只有 `GITMNG_ROUTE_HOST` 会用 `GITMNG_PROBE_REPO` 做链路实测，其余主机只测 HTTPS 可达性——拿 GitHub 的公共仓库去 Gitee 做 `ls-remote` 必然失败，多平台用户不应看到那条假警报。
+- `tests/run.sh`：30 项自测，全程临时 HOME 沙箱，不触碰真实配置与网络。
 - `docs/the-scp-glob-trap.sh`：可执行的通配符行为验证，输出与文档表格一致。

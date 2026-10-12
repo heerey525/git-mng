@@ -19,4 +19,6 @@ GITMNG_GHPROXY="https://gh-proxy.com/"
 GITMNG_ROUTE_HOST="github.com"
 
 # route bench / doctor 用的探测仓库：必须是公开、体积极小、不含私人内容
+# 只有 GITMNG_ROUTE_HOST 会用它做链路实测；其他主机（如 Gitee）只测 HTTPS 可达性，
+# 因为拿 GitHub 的仓库去 Gitee 做 ls-remote 必然失败。用 git-mng probe-url <host> 可自查。
 GITMNG_PROBE_REPO="octocat/Hello-World"

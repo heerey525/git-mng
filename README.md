@@ -61,6 +61,7 @@ git-mng doctor
 | `git-mng route bench` | 用同一个公共仓库，把 `direct` / `proxy` / `ssh` 各测 3 次，打印成功率 |
 | `git-mng route ssh\|proxy\|direct\|status` | 互斥地设置 `url.<...>.insteadOf` 重写；`status` 查看当前路由 |
 | `git-mng login <host>` | 交互录入该主机的 HTTPS 凭据（令牌不回显），先用真实 `ls-remote` 验证，失败自动从钥匙串撤销 |
+| `git-mng probe-url [host]` | 打印 `doctor` 对该主机的探测方式与地址：路由主机走链路实测，其余主机只测 HTTPS 可达性 |
 | `git-mng version` | 版本与生效配置自检 |
 
 ## 配置
@@ -74,7 +75,7 @@ GITMNG_SCAN_ROOTS="$HOME/code $HOME/projects"           # 仓库扫描根目录
 GITMNG_SCAN_MAXDEPTH=4
 GITMNG_GHPROXY="https://gh-proxy.com/"                  # route proxy 的镜像前缀（换成你自己的）
 GITMNG_ROUTE_HOST="github.com"                          # 路由重写作用的主机
-GITMNG_PROBE_REPO="octocat/Hello-World"                 # 路由实测用的公共小仓库
+GITMNG_PROBE_REPO="octocat/Hello-World"                 # 路由实测用的公共小仓库（仅 ROUTE_HOST 用它）
 ```
 
 身份文件在 `~/.config/git-mng/identity/<host>`，一个主机一个，内容就是 `[user] name/email`。
@@ -107,7 +108,7 @@ GITMNG_PROBE_REPO="octocat/Hello-World"                 # 路由实测用的公�
 ## 开发
 
 ```bash
-./tests/run.sh     # 28 项自测，全程临时 HOME 沙箱，不碰真实配置和网络
+./tests/run.sh     # 30 项自测，全程临时 HOME 沙箱，不碰真实配置和网络
 ```
 
 `bash 3.2` 兼容（不用关联数组等 4.x 特性），CI 里建议 `shellcheck -s bash`。
