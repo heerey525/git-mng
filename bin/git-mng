@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+# git-mng — 本机 GitHub / Gitee（或任意自建 Git 服务）的凭据、提交身份与访问路由体检工具
+#
+#   macOS + bash 3.2+ + git 2.36+   无第三方依赖（只用 git/ssh/curl/security/awk/sed/find）
+#   它不改你的仓库内容，只读 + 明确写配置时打印改动并先备份。
+#
+set -u
+
+VERSION="0.1.0"
+
+# ---------------------------------------------------------------- 配置
+# 可选文件：${GITMNG_CONFIG:-$HOME/.config/git-mng/config}，shell 语法直接 source
+# 必须先 source，再算派生变量——否则配置文件里的 GITMNG_* 不生效
+[ -f "${GITMNG_CONFIG:-$HOME/.config/git-mng/config}" ] && . "${GITMNG_CONFIG:-$HOME/.config/git-mng/config}"
+
+GHPROXY="${GITMNG_GHPROXY:-https://gh-proxy.com/}"
+PROBE_REPO="${GITMNG_PROBE_REPO:-octocat/Hello-World}"   # 公共小仓库，测路由用
+ROUTE_HOST="${GITMNG_ROUTE_HOST:-github.com}"            # 路由重写作用的主机
+HOSTS="${GITMNG_HOSTS:-github.com gitee.com}"            # 参与身份/凭据检查的主机
+SCAN_ROOTS="${GITMNG_SCAN_ROOTS:-$HOME}"
+SCAN_MAXDEPTH="${GITMNG_SCAN_MAXDEPTH:-4}"
+OWNER_ACCOUNT="${GITMNG_OWNER_ACCOUNT:-}"                # 你自己的账号名（fix-ssh 判定用）
+
+ID_DIR="$HOME/.config/git-mng/identity"
+BLOCK_BEGIN="# >>> git-mng identity routing >>>"
+BLOCK_END="# <<< git-mng identity routing <<<"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32mOK\033[0m   %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
+info() { printf '       %s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+git-mng — GitHub / Gitee 凭据、提交身份与访问路由体检
+
+  git-mng init               生成「按 remote 地址自动切换提交身份」的规则（含备份）
+  git-mng init --revert      移除 init 写入的规则块（保留身份文件）
+  git-mng doctor             体检：配置 / 身份 / 凭据 / 连通性 / 路由
+  git-mng identity           逐仓库打印生效身份并比对期望值
+  git-mng repos [--fetch]    按平台列本机仓库（--fetch 先刷新远程）
+  git-mng fix-ssh            自有账号 remote 改 SSH；清理镜像前缀残留
+  git-mng route bench        实测 direct / 镜像 / SSH 三条链路成功率
+  git-mng route ssh|proxy|direct|status    切换访问路由（互斥）
+  git-mng login <host>       交互录入该主机凭据并验证（失败自动撤销）
+  git-mng version            版本与自检
+
+配置文件（可选）~/.config/git-mng/config，shell 语法：
+  GITMNG_HOSTS="github.com gitee.com gitlab.example.com"
+  GITMNG_OWNER_ACCOUNT="your-gh-login"        # fix-ssh 判定自有仓库
+  GITMNG_SCAN_ROOTS="$HOME/code $HOME/projects"
+  GITMNG_GHPROXY="https://gh-proxy.com/"      # route proxy 用的镜像前缀
+  GITMNG_PROBE_REPO="octocat/Hello-World"
+EOF
+}
+
+# ---------------------------------------------------------------- 通用工具
+git_ver_num() { git --version 2>/dev/null | sed -E 's/git version ([0-9]+)\.([0-9]+).*/\1\2/' | sed 's/^0*//'; }
+
+platform_of() {
+  case "$1" in
+    *gh-proxy*|*github.com*) echo github ;;
+    *gitee.com*) echo gitee ;;
+    http*://192.168.*|http*://10.*|http*://172.1[6-9].*|http*://172.2[0-9].*|http*://172.3[01].*) echo intranet ;;
+    "") echo none ;;
+    *) echo other ;;
+  esac
+}
+
+host_of_url() {
+  printf '%s\n' "$(strip_mirror "$1")" | sed -E -e 's#^(https?|ssh|git)://##' -e 's#^[^/@]+@##' -e 's#[:/].*$##'
+}
+
+# scp 式 git@host:owner/repo 与 URL 式都能取出 owner
+account_of() {
+  printf '%s\n' "$(strip_mirror "$1")" | sed -E \
+    -e 's#^ssh://##' -e 's#^(https?|git)://##' -e 's#^[^/@]+@##' \
+    -e 's#^[^/:]+[:/]##' -e 's#/.*$##'
+}
+
+# 还原被写进 remote 的镜像前缀（历史遗留）；优先用配置里的镜像前缀，再退回通用猜测
+strip_mirror() {
+  case "$1" in
+    "$GHPROXY"*) printf '%s\n' "${1#$GHPROXY}" ;;
+    *) printf '%s\n' "$1" | sed -E 's#^https?://[^/]*(gh-proxy|mirror)[^/]*/(https?://)#\2#' ;;
+  esac
+}
+
+remote_url() { git -C "$1" config --get remote.origin.url 2>/dev/null; }
+
+collect_repos() {
+  for r in $SCAN_ROOTS; do
+    [ -d "$r" ] || continue
+    find "$r" -maxdepth "$SCAN_MAXDEPTH" -type d -name .git \
+      -not -path '*/node_modules/*' -not -path '*/.Trash/*' -not -path '*/Library/*' \
+      -not -path '*/.*/.git/*' 2>/dev/null
+  done | sed 's#/\.git$##' | sort -u
+}
+
+# 带超时的只读探测；禁掉一切交互，靠凭据成功才算通过
+probe_git() {
+  GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
+    git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15 \
+    ls-remote --heads "$1" >/dev/null 2>&1
+}
+
+store_credential() {
+  printf 'protocol=https\nhost=%s\nusername=%s\npassword=%s\n\n' "$1" "$2" "$3" | git credential approve
+}
+erase_credential() { printf 'protocol=https\nhost=%s\n\n' "$1" | git credential reject; }
+has_keychain_entry() { security find-internet-password -s "$1" >/dev/null 2>&1; }
+
+host_label() {
+  case "$1" in
+    github.com) echo GitHub ;; gitee.com) echo Gitee ;;
+    *) echo "$1" ;;
+  esac
+}
+
+expected_identity() {
+  f="$ID_DIR/$1"
+  [ -f "$f" ] || { echo ""; return; }
+  printf '%s <%s>' "$(git config --file "$f" --get user.name 2>/dev/null)" \
+                   "$(git config --file "$f" --get user.email 2>/dev/null)"
+}
+
+# ---------------------------------------------------------------- init
+write_block() {
+  {
+    echo "$BLOCK_BEGIN"
+    echo "# 由 git-mng init 生成。按 remote.origin.url 自动加载对应提交身份。"
+    echo "# 注意这版 git 的 * 不跨 /：scp 式地址必须写成 */**，写成 host:** 会静默不生效。"
+    echo "# 必须位于 [user] 之后，include 的值后写入才能覆盖兜底身份。"
+    for h in $HOSTS; do
+      echo "[includeIf \"hasconfig:remote.*.url:https://$h/**\"]"
+      echo "	path = $ID_DIR/$h"
+      echo "[includeIf \"hasconfig:remote.*.url:ssh://git@$h/**\"]"
+      echo "	path = $ID_DIR/$h"
+      echo "[includeIf \"hasconfig:remote.*.url:git@$h:*/**\"]"
+      echo "	path = $ID_DIR/$h"
+    done
+    echo "$BLOCK_END"
+  }
+}
+
+cmd_init() {
+  revert=0; dry=0
+  for a in "$@"; do
+    case "$a" in --revert) revert=1 ;; --dry-run) dry=1 ;; esac
+  done
+
+  if [ "$revert" = "1" ]; then
+    [ -f "$HOME/.gitconfig" ] || { bad "没有 ~/.gitconfig"; return 1; }
+    awk -v B="$BLOCK_BEGIN" -v E="$BLOCK_END" '
+      $0==B {skip=1; next} $0==E {skip=0; next} !skip {print}' "$HOME/.gitconfig" > "$HOME/.gitconfig.gitmngtmp" \
+      || { bad "生成临时文件失败"; rm -f "$HOME/.gitconfig.gitmngtmp"; return 1; }
+    mv "$HOME/.gitconfig" "$HOME/.gitconfig.bak.gitmng.$(date +%Y%m%d%H%M%S)"
+    mv "$HOME/.gitconfig.gitmngtmp" "$HOME/.gitconfig"
+    ok "已移除身份路由规则块；身份文件仍留在 $ID_DIR（要一并删请手动）"
+    return 0
+  fi
+
+  if [ "$(git_ver_num)" -lt 236 ]; then
+    bad "git 版本过低，includeIf hasconfig 需要 git >= 2.36（当前 $(git --version)）"
+    return 1
+  fi
+
+  mkdir -p "$ID_DIR"
+  for h in $HOSTS; do
+    [ -f "$ID_DIR/$h" ] && cur=$(expected_identity "$h") || cur=""
+    printf '%s 提交身份 [%s]: ' "$(host_label "$h")" "${cur:-name <email>}"
+    read -r line
+    [ -z "$line" ] && line="$cur"
+    case "$line" in
+      *"<"*">"*) : ;;
+      *) bad "格式应为 'Name <email>'，已跳过 $h"; continue ;;
+    esac
+    n=$(printf '%s' "$line" | sed -E 's# *<.*##')
+    e=$(printf '%s' "$line" | sed -E 's#.*<([^>]*)>.*#\1#')
+    [ -z "$e" ] && { bad "邮箱解析失败，已跳过 $h"; continue; }
+    if [ "$dry" = "1" ]; then
+      info "[dry-run] 将写 $ID_DIR/$h → $n $e"
+    else
+      printf '# %s 提交身份（由 git-mng init 生成）\n[user]\n\tname = %s\n\temail = %s\n' \
+        "$(host_label "$h")" "$n" "$e" > "$ID_DIR/$h"
+      ok "$h → $n $e"
+    fi
+  done
+
+  echo
+  if [ "$dry" = "1" ]; then
+    bold "[dry-run] 将追加到 ~/.gitconfig 的规则块："
+    write_block | sed 's/^/  /'
+    return 0
+  fi
+  cp "$HOME/.gitconfig" "$HOME/.gitconfig.bak.gitmng.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+  if grep -qF "$BLOCK_BEGIN" "$HOME/.gitconfig" 2>/dev/null; then
+    awk -v B="$BLOCK_BEGIN" -v E="$BLOCK_END" '$0==B{skip=1;next} $0==E{skip=0;next} !skip{print}' \
+      "$HOME/.gitconfig" > "$HOME/.gitconfig.gitmngtmp" && mv "$HOME/.gitconfig.gitmngtmp" "$HOME/.gitconfig"
+    info "已替换旧的规则块"
+  fi
+  echo >> "$HOME/.gitconfig"
+  write_block >> "$HOME/.gitconfig"
+  ok "规则已写入 ~/.gitconfig（备份保留在 ~/.gitconfig.bak.gitmng.*）"
+  echo
+  info "下一步：git-mng identity 复查各仓库生效身份"
+}
+
+# ---------------------------------------------------------------- identity
+cmd_identity() {
+  bold "按远程地址自动切换的提交身份"
+  info "机制：~/.gitconfig 里 includeIf hasconfig 规则（需 git >= 2.36）"
+  for h in $HOSTS; do
+    id=$(expected_identity "$h")
+    [ -n "$id" ] && info "$(host_label "$h") → $id" || warn "缺 $ID_DIR/$h → 运行 git-mng init"
+  done
+  echo
+  printf '  %-26s %-14s %-13s %-30s %s\n' "仓库" "主机" "生效 name" "生效 email" "判定"
+  badn=0
+  collect_repos | while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    u=$(remote_url "$d"); h=$(host_of_url "$u")
+    n=$(git -C "$d" config user.name 2>/dev/null)
+    e=$(git -C "$d" config user.email 2>/dev/null)
+    want=$(expected_identity "$h")
+    case "$h" in
+      ""|none) v="(无远程，不走规则)" ;;
+      *) if [ -z "$want" ]; then v="(未配身份)"; else
+           [ "$n $e" = "$want" ] && v="一致" || { v="不一致，期望 $want"; badn=$((badn+1)); }
+         fi ;;
+    esac
+    printf '  %-26s %-14s %-13s %-30s %s\n' "$(basename "$d")" "${h:-（无）}" "${n:-（空）}" "${e:-（空）}" "$v"
+  done
+  echo
+  info "「不一致」两种原因：该仓库设了局部 user.name/email（局部优先），或 remote 主机没进 GITMNG_HOSTS"
+}
+
+# ---------------------------------------------------------------- repos
+cmd_repos() {
+  do_fetch=0
+  [ "${1:-}" = "--fetch" ] && do_fetch=1
+  tmp=$(mktemp); : > "$tmp"
+  bold "本机仓库清单"
+  info "扫描根: $SCAN_ROOTS（深度 $SCAN_MAXDEPTH）"
+  echo
+  collect_repos | while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    u=$(remote_url "$d")
+    disp="${u:-（无远程）}"
+    case "$u" in *gh-proxy*|*mirror*) disp="$(strip_mirror "$u")  ← remote 里残留镜像前缀，建议 git-mng fix-ssh" ;; esac
+    branch=$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "-")
+    dirty=$(git -C "$d" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if git -C "$d" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+      up=$(git -C "$d" rev-parse --abbrev-ref '@{u}' 2>/dev/null)
+      cnt=$(git -C "$d" rev-list --left-right --count "$up...HEAD" 2>/dev/null)
+      ab="+$(printf '%s' "$cnt" | cut -f2)/-$(printf '%s' "$cnt" | cut -f1)"
+    else
+      ab="无上游"
+    fi
+    [ "$dirty" = "0" ] && st="干净" || st="脏($dirty)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(host_of_url "$u")" "$disp" "$(basename "$d")" "$branch" "$st" "$ab" >> "$tmp"
+    if [ "$do_fetch" = "1" ]; then
+      GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false git -C "$d" fetch --quiet origin >/dev/null 2>&1 \
+        && info "fetched $(basename "$d")" || warn "fetch 失败 $(basename "$d")"
+    fi
+  done
+  awk -F'\t' '{print $1}' "$tmp" | sort | uniq | while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    n=$(awk -F'\t' -v H="$h" '$1==H' "$tmp" | wc -l | tr -d ' ')
+    bold "${h:-（无远程）} ($n)"
+    awk -F'\t' -v H="$h" '$1==H {printf "  %-26s %-12s %-10s %s\n      %s\n", $3, $4, $5, $6, $2}' "$tmp"
+    echo
+  done
+  rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------- fix-ssh
+cmd_fix_ssh() {
+  if [ -z "$OWNER_ACCOUNT" ]; then
+    bad "未设置 GITMNG_OWNER_ACCOUNT（你的自有账号名），无法区分自有/第三方仓库"
+    info "在 ~/.config/git-mng/config 里加：GITMNG_OWNER_ACCOUNT=\"your-gh-login\""
+    return 2
+  fi
+  host="${1:-github.com}"
+  bold "规范化 $host 的 remote 地址"
+  collect_repos | while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    url=$(remote_url "$d")
+    direct=$(strip_mirror "$url")
+    [ "$(host_of_url "$direct")" = "$host" ] || continue
+    acct=$(account_of "$direct")
+    path=$(printf '%s' "$direct" | sed -E "s#^(https?://$host/|ssh://git@$host/|git@$host:)##; s#\.git\$##")
+    if [ "$acct" = "$OWNER_ACCOUNT" ]; then
+      new="git@$host:${path}.git"; why="自有账号 → SSH 才能推送"
+    else
+      new="https://$host/${path}.git"; why="第三方只读 → 直连 HTTPS"
+    fi
+    [ "$new" = "$url" ] && continue
+    if git -C "$d" remote set-url origin "$new" 2>/dev/null; then
+      ok "$(basename "$d"): $url → $new"; info "  $why"
+    else
+      bad "$(basename "$d") 改写失败"
+    fi
+  done
+  echo
+  info "自有账号判定: $OWNER_ACCOUNT"
+}
+
+# ---------------------------------------------------------------- route
+SSH_PREFIX_ROUTE() { printf 'git@%s:' "$ROUTE_HOST"; }
+
+route_current() {
+  k1="url.$(SSH_PREFIX_ROUTE).insteadOf"
+  k2="url.${GHPROXY}https://${ROUTE_HOST}/.insteadOf"
+  if [ "$(git config --global --get "$k1" 2>/dev/null)" = "https://${ROUTE_HOST}/" ]; then echo ssh
+  elif [ "$(git config --global --get "$k2" 2>/dev/null)" = "https://${ROUTE_HOST}/" ]; then echo proxy
+  else echo direct; fi
+}
+
+route_apply() {
+  k1="url.$(SSH_PREFIX_ROUTE).insteadOf"
+  k2="url.${GHPROXY}https://${ROUTE_HOST}/.insteadOf"
+  git config --global --unset "$k1" 2>/dev/null
+  git config --global --unset "$k2" 2>/dev/null
+  case "$1" in
+    ssh)   git config --global "$k1" "https://${ROUTE_HOST}/" ;;
+    proxy) git config --global "$k2" "https://${ROUTE_HOST}/" ;;
+    direct) : ;;
+  esac
+  ok "$ROUTE_HOST 路由 → $1"
+}
+
+route_url() {
+  case "$1" in
+    proxy) printf '%shttps://%s/%s\n' "$GHPROXY" "$ROUTE_HOST" "$2" ;;
+    direct) printf 'https://%s/%s\n' "$ROUTE_HOST" "$2" ;;
+    ssh)   printf 'git@%s:%s\n' "$ROUTE_HOST" "$2" ;;
+  esac
+}
+
+cmd_route() {
+  action="${1:-status}"
+  case "$action" in
+    ssh|proxy|direct)
+      route_apply "$action"
+      if probe_git "https://${ROUTE_HOST}/${PROBE_REPO}"; then
+        ok "路由生效：访问 https://${ROUTE_HOST}/${PROBE_REPO} 成功"
+      else
+        warn "路由已设置但本次实测失败 → git-mng route bench 对比三条链路"
+      fi
+      ;;
+    status)
+      cur=$(route_current)
+      info "当前 $ROUTE_HOST 路由: $cur"
+      case "$cur" in
+        ssh) info "https://${ROUTE_HOST}/ 请求自动走 SSH（可推送，避开 443 抖动）" ;;
+        proxy) info "https://${ROUTE_HOST}/ 请求走镜像 $GHPROXY（只读；推送请用 SSH remote）" ;;
+        direct) info "HTTPS 直连 ${ROUTE_HOST}（不重写）" ;;
+      esac
+      ;;
+    bench)
+      bold "$ROUTE_HOST 三条链路各测 3 次（Y=通 N=不通）"
+      info "探针仓库: $PROBE_REPO（公共、小、无隐私）"
+      for r in direct proxy ssh; do
+        s=""
+        for i in 1 2 3; do
+          case "$r" in
+            ssh) GIT_SSH_COMMAND="ssh -o ConnectTimeout=10 -o BatchMode=yes" \
+                   git ls-remote --heads "$(route_url ssh "$PROBE_REPO")" >/dev/null 2>&1 && s="${s}Y" || s="${s}N" ;;
+            *)   # 绕过全局配置：否则当前路由的重写规则会污染测量
+                   GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
+                   git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15 \
+                   ls-remote --heads "$(route_url "$r" "$PROBE_REPO")" >/dev/null 2>&1 && s="${s}Y" || s="${s}N" ;;
+          esac
+        done
+        printf '  %-7s %s\n' "$r" "$s"
+      done
+      info "选成功率最高的那条：git-mng route <direct|proxy|ssh>"
+      ;;
+    *) bad "用法: git-mng route ssh|proxy|direct|status|bench"; return 2 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- login
+cmd_login() {
+  h="${1:-}"
+  [ -z "$h" ] && { bad "用法: git-mng login <host>，例如 git-mng login gitee.com"; return 2; }
+  bold "$h 凭据录入"
+  info "私人令牌在平台设置里生成（Gitee 勾 projects 读写；GitHub 需 repo 权限）"
+  info "令牌只经交互输入进入系统钥匙串：不落对话、不落 shell 历史、不落脚本文件"
+  echo
+  guess=""
+  for d in $(collect_repos); do
+    u=$(remote_url "$d")
+    [ "$(host_of_url "$u")" = "$h" ] && { guess=$(account_of "$u"); break; }
+  done
+  printf "账号名 [%s]: " "${guess:-}"
+  read -r user
+  [ -z "$user" ] && user="$guess"
+  [ -z "$user" ] && { bad "无法确定账号名，请手动输入后重试"; return 1; }
+  printf "令牌/密码（不回显）: "
+  read -rs secret
+  echo
+  [ -z "$secret" ] && { warn "输入为空，已取消，未改动钥匙串"; return 1; }
+
+  probe=""
+  for d in $(collect_repos); do
+    u=$(remote_url "$d")
+    [ "$(host_of_url "$u")" = "$h" ] && { probe=$(printf '%s' "$u" | sed -E "s#.*$h/##; s#\.git\$##"); break; }
+  done
+  [ -z "$probe" ] && probe="${user}/x"
+  url="https://$h/${probe}.git"
+
+  store_credential "$h" "$user" "$secret"
+  info "已写入钥匙串，用 $url 验证..."
+  if GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false git ls-remote --heads "$url" >/dev/null 2>&1; then
+    ok "$h 免密访问可用（账号 $user）"
+  else
+    bad "验证失败，已撤销该凭据"
+    erase_credential "$h"
+    info "排查：令牌权限/是否过期/账号名拼写/该仓库是否可读"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------- doctor
+cmd_doctor() {
+  bold "git-mng doctor"
+  echo
+  bold "环境"
+  gv=$(git --version 2>/dev/null)
+  info "$gv"
+  if [ "$(git_ver_num)" -lt 236 ]; then
+    warn "身份自动路由需 git >= 2.36，当前版本不支持 includeIf hasconfig"
+  else
+    ok "支持 includeIf hasconfig（身份按 remote 自动切换的前提）"
+  fi
+  uname_s=$(uname -s)
+  [ "$uname_s" = "Darwin" ] && ok "macOS 钥匙串可用（凭据后端）" || warn "非 macOS（$uname_s）：本工具 v0.1 只支持 macOS 凭据后端"
+
+  bold "全局配置"
+  helper=$(git config --global --get credential.helper 2>/dev/null)
+  [ "$helper" = "osxkeychain" ] && ok "credential.helper = osxkeychain" \
+    || bad "credential.helper = ${helper:-未设置}（macOS 建议 osxkeychain）"
+  info "兜底身份: $(git config --global --get user.name 2>/dev/null) <$(git config --global --get user.email 2>/dev/null)>"
+  [ -n "$(git config --global --get http.lowSpeedLimit 2>/dev/null)" ] \
+    && ok "已设 http.lowSpeedLimit，连不上时会超时放弃" \
+    || warn "未设 http.lowSpeedLimit：网络抽风时 git 可能挂几十秒到几分钟"
+  [ "$(git config --global --get safe.directory 2>/dev/null)" = "*" ] \
+    && warn "safe.directory=* 放行所有目录（权限偏宽，按需收紧）"
+  cmd_route status
+
+  echo
+  bold "提交身份路由"
+  if grep -qF "$BLOCK_BEGIN" "$HOME/.gitconfig" 2>/dev/null; then
+    ok "~/.gitconfig 含 git-mng 规则块"
+    m=$(cmd_identity 2>/dev/null | grep -c '期望')
+    [ "$m" = "0" ] && ok "所有已配主机的仓库身份一致" || warn "$m 个仓库身份与规则不一致 → git-mng identity"
+  else
+    bad "未配置身份路由 → git-mng init"
+  fi
+
+  echo
+  for h in $HOSTS; do
+    bold "$h"
+    if has_keychain_entry "$h"; then ok "钥匙串存在 $h 凭据"; else warn "钥匙串无 $h 凭据 → git-mng login $h"; fi
+    sshout=$(ssh -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o BatchMode=yes -T "git@$h" 2>&1 | head -1)
+    case "$sshout" in
+      *uccessfully\ authenticated*|*uccessfully*) ok "SSH: $sshout" ;;
+      *Permission\ denied*) info "SSH 未授权（若走 HTTPS+令牌则正常）" ;;
+      "") info "SSH 无响应（22 端口可能被拦）" ;;
+      *)  info "SSH: $sshout" ;;
+    esac
+    if probe_git "$(route_url "$(route_current)" "$PROBE_REPO" 2>/dev/null || printf 'https://%s/%s' "$h" "$PROBE_REPO")"; then
+      ok "$(route_current) 路由实测可读"
+    else
+      warn "$(route_current) 路由实测失败 → git-mng route bench"
+    fi
+  done
+}
+
+cmd_version() {
+  printf 'git-mng %s\n' "$VERSION"
+  printf 'git: %s\nbash: %s\nos: %s\n' "$(git --version)" "$BASH_VERSION" "$(uname -sr)"
+  printf 'hosts=%s route_host=%s owner=%s probe=%s\n' "$HOSTS" "$ROUTE_HOST" "${OWNER_ACCOUNT:-（未设）}" "$PROBE_REPO"
+}
+
+# ---------------------------------------------------------------- 入口
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  init)     cmd_init "$@" ;;
+  doctor)   cmd_doctor ;;
+  identity) cmd_identity ;;
+  repos)    cmd_repos "$@" ;;
+  fix-ssh)  cmd_fix_ssh "$@" ;;
+  route)    cmd_route "$@" ;;
+  login)    cmd_login "$@" ;;
+  version|--version) cmd_version ;;
+  ""|-h|--help|help) usage ;;
+  *) bad "未知命令: $cmd"; usage; exit 2 ;;
+esac

@@ -1,0 +1,22 @@
+# git-mng 配置示例：复制到 ~/.config/git-mng/config 后按需修改（shell 语法，会被直接 source）
+# 不创建该文件也能用，全部走默认值。
+
+# 参与「提交身份自动切换」与凭据/连通性检查的主机（空格分隔）
+GITMNG_HOSTS="github.com gitee.com"
+
+# 你自己的登录账号名。fix-ssh 用它区分「自有仓库（转 SSH 以便推送）」和
+# 「第三方仓库（保留只读 HTTPS）」。不设则 fix-ssh 拒绝猜测并报错。
+GITMNG_OWNER_ACCOUNT=""
+
+# 仓库扫描根目录与深度。越精确越快，建议只写放代码的目录。
+GITMNG_SCAN_ROOTS="$HOME"
+GITMNG_SCAN_MAXDEPTH=4
+
+# route proxy 使用的镜像前缀。请换成你自己信任的镜像，或自建。
+GITMNG_GHPROXY="https://gh-proxy.com/"
+
+# 路由重写作用于哪个主机（多平台时按主要痛点填）
+GITMNG_ROUTE_HOST="github.com"
+
+# route bench / doctor 用的探测仓库：必须是公开、体积极小、不含私人内容
+GITMNG_PROBE_REPO="octocat/Hello-World"
