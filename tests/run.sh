@@ -86,6 +86,9 @@ eq "naive host:** 在 scp 式地址上不生效（故须用 */**）" "fallback@e
 echo "== 4. identity 体检输出 =="
 out=$("$TOOL" identity 2>&1)
 has "列出各主机期望身份" "gh.test → Alice <alice@example.com>" "$out"
+# 判定必须逐字符比对 Name <email>，写成 "$n $e" 会让所有仓库都误判不一致
+eq "身份完全一致的仓库数" "4" "$(printf '%s\n' "$out" | grep -c '一致$')"
+eq "被标出不一致的仓库数（镜像残留 f + 局部覆盖 g）" "2" "$(printf '%s\n' "$out" | grep -c '不一致，期望')"
 has "scp 式仓库判定一致" "一致" "$out"
 has "局部覆盖的仓库标出不一致" "不一致，期望 Alice <alice@example.com>" "$out"
 

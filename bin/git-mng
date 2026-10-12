@@ -218,18 +218,18 @@ cmd_identity() {
   done
   echo
   printf '  %-26s %-14s %-13s %-30s %s\n' "仓库" "主机" "生效 name" "生效 email" "判定"
-  badn=0
   collect_repos | while IFS= read -r d; do
     [ -n "$d" ] || continue
     u=$(remote_url "$d"); h=$(host_of_url "$u")
     n=$(git -C "$d" config user.name 2>/dev/null)
     e=$(git -C "$d" config user.email 2>/dev/null)
     want=$(expected_identity "$h")
+    got="$n <$e>"
     case "$h" in
       ""|none) v="(无远程，不走规则)" ;;
-      *) if [ -z "$want" ]; then v="(未配身份)"; else
-           [ "$n $e" = "$want" ] && v="一致" || { v="不一致，期望 $want"; badn=$((badn+1)); }
-         fi ;;
+      *) if [ -z "$want" ]; then v="(未配身份)";
+         elif [ "$got" = "$want" ]; then v="一致";
+         else v="不一致，期望 $want"; fi ;;
     esac
     printf '  %-26s %-14s %-13s %-30s %s\n' "$(basename "$d")" "${h:-（无）}" "${n:-（空）}" "${e:-（空）}" "$v"
   done
@@ -482,8 +482,16 @@ cmd_doctor() {
   echo
   for h in $HOSTS; do
     bold "$h"
-    if has_keychain_entry "$h"; then ok "钥匙串存在 $h 凭据"; else warn "钥匙串无 $h 凭据 → git-mng login $h"; fi
     sshout=$(ssh -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o BatchMode=yes -T "git@$h" 2>&1 | head -1)
+    ssh_ok=0
+    case "$sshout" in *uccessfully*) ssh_ok=1 ;; esac
+    if has_keychain_entry "$h"; then
+      ok "钥匙串存在 $h 凭据"
+    elif [ "$ssh_ok" = 1 ]; then
+      info "钥匙串无 $h 的 HTTPS 凭据；SSH 已授权 → 走 SSH 无需录入"
+    else
+      warn "钥匙串无 $h 凭据 → git-mng login $h"
+    fi
     case "$sshout" in
       *uccessfully\ authenticated*|*uccessfully*) ok "SSH: $sshout" ;;
       *Permission\ denied*) info "SSH 未授权（若走 HTTPS+令牌则正常）" ;;

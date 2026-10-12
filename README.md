@@ -108,7 +108,7 @@ GITMNG_PROBE_REPO="octocat/Hello-World"                 # 路由实测用的公�
 ## 开发
 
 ```bash
-./tests/run.sh     # 30 项自测，全程临时 HOME 沙箱，不碰真实配置和网络
+./tests/run.sh     # 32 项自测，全程临时 HOME 沙箱，不碰真实配置和网络
 ```
 
 `bash 3.2` 兼容（不用关联数组等 4.x 特性），CI 里建议 `shellcheck -s bash`。
